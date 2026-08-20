@@ -46,7 +46,6 @@ from torchtitan.models.common.config_utils import (
 from torchtitan.models.deepseek_v3.model import Attention as DeepSeekV3Attention
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.trainer import Trainer
-
 from . import KIMI_K2_5_SPECIAL_TOKENS, KimiK25Model, model_registry
 
 
@@ -270,11 +269,16 @@ def _per_expert_compute_layout(parallelism: ParallelismConfig) -> ComputeLayout:
     ep_size = parallelism.expert_parallel_degree
     if ep_size <= 0:
         raise ValueError("expert_parallel_degree must be positive")
+    # Routed experts use TP only without EP. With EP enabled, their sparse
+    # mesh contains EDP_SHARD and EP axes instead of TP.
     if ep_size == 1:
+        shardings_by_mesh_axis = {
+            MeshAxisName.DP_SHARD.value: Shard(0),
+        }
+        if parallelism.tensor_parallel_degree > 1:
+            shardings_by_mesh_axis[MeshAxisName.TP.value] = Shard(0)
         return ComputeLayout(
-            shardings_by_mesh_axis={
-                MeshAxisName.DP_SHARD.value: Shard(0),
-            },
+            shardings_by_mesh_axis=shardings_by_mesh_axis,
         )
 
     # Preserve exact EP-first DTensor ownership. If an EP-local expert count is
@@ -293,28 +297,38 @@ def _per_expert_compute_layout(parallelism: ParallelismConfig) -> ComputeLayout:
     )
 
 
-def _dist_muon_optimizer(
+def _dist_muon_compute_config(
     model_config: KimiK25Model.Config,
     *,
-    muon_lr: float,
-    adamw_lr: float,
     parallelism: ParallelismConfig,
-) -> OptimizersContainer.Config:
+) -> tuple[dict[str, ComputeLayout], tuple[BucketConfig, ...], str]:
     attention = cast(DeepSeekV3Attention.Config, model_config.first_attention)
+    tp_enabled = parallelism.tensor_parallel_degree > 1
+    owned_shardings = {
+        MeshAxisName.DP_SHARD.value: Owned(),
+    }
+    if tp_enabled:
+        owned_shardings[MeshAxisName.TP.value] = Owned()
     owned = ComputeLayout(
-        shardings_by_mesh_axis={
-            MeshAxisName.DP_SHARD.value: Owned(),
-        },
+        shardings_by_mesh_axis=owned_shardings,
     )
     # Kimi runs Newton-Schulz per logical projection within each MLA head.
+    query_head_blocks = BlockShard(
+        dim=0,
+        block_sizes=(attention.qk_nope_head_dim, attention.qk_rope_head_dim),
+    )
+    query_head_shardings = {
+        MeshAxisName.DP_SHARD.value: query_head_blocks,
+    }
+    if tp_enabled:
+        query_head_shardings[MeshAxisName.TP.value] = query_head_blocks
     per_query_head = ComputeLayout(
-        shardings_by_mesh_axis={
-            MeshAxisName.DP_SHARD.value: BlockShard(
-                dim=0,
-                # per head: [q_nope_h; q_rope_h]
-                block_sizes=(attention.qk_nope_head_dim, attention.qk_rope_head_dim),
-            )
-        },
+        shardings_by_mesh_axis=query_head_shardings,
+        shard_order_by_tensor_dim=(
+            {0: (MeshAxisName.TP.value, MeshAxisName.DP_SHARD.value)}
+            if tp_enabled
+            else {}
+        ),
     )
     kv_latent_and_rope = ComputeLayout(
         shardings_by_mesh_axis={
@@ -325,14 +339,22 @@ def _dist_muon_optimizer(
             )
         },
     )
+    key_value_head_blocks = BlockShard(
+        dim=0,
+        block_sizes=(attention.qk_nope_head_dim, attention.v_head_dim),
+    )
+    key_value_head_shardings = {
+        MeshAxisName.DP_SHARD.value: key_value_head_blocks,
+    }
+    if tp_enabled:
+        key_value_head_shardings[MeshAxisName.TP.value] = key_value_head_blocks
     per_key_value_head = ComputeLayout(
-        shardings_by_mesh_axis={
-            MeshAxisName.DP_SHARD.value: BlockShard(
-                dim=0,
-                # per head: [k_nope_h; v_h]
-                block_sizes=(attention.qk_nope_head_dim, attention.v_head_dim),
-            )
-        },
+        shardings_by_mesh_axis=key_value_head_shardings,
+        shard_order_by_tensor_dim=(
+            {0: (MeshAxisName.TP.value, MeshAxisName.DP_SHARD.value)}
+            if tp_enabled
+            else {}
+        ),
     )
     per_expert = _per_expert_compute_layout(parallelism)
     query_shardings: dict[str, ComputeLayout] = (
@@ -349,19 +371,14 @@ def _dist_muon_optimizer(
         "wkv_b": per_key_value_head,
         "wo": owned,
     }
+    w13_shardings = {MeshAxisName.DP_SHARD.value: Shard(0)}
+    if tp_enabled:
+        w13_shardings[MeshAxisName.TP.value] = Shard(0)
     feed_forward_shardings = {
-        "w13": ComputeLayout(
-            shardings_by_mesh_axis={MeshAxisName.DP_SHARD.value: Shard(0)},
-        ),
+        "w13": ComputeLayout(shardings_by_mesh_axis=w13_shardings),
         "w2": owned,
     }
     num_layers = len(model_config.layers)
-    adamw_kwargs = {
-        "lr": adamw_lr,
-        "betas": (0.9, 0.95),
-        "eps": 1e-8,
-        "weight_decay": 0.1,
-    }
     expert_projections = ("w13.weight", "w2.weight")
 
     def compute_shardings_for_layer(
@@ -417,7 +434,24 @@ def _dist_muon_optimizer(
         non_routed_fqns = tuple(
             fqn for fqn in fqns if compute_sharding_by_fqn[fqn] is not per_expert
         )
-        bucket_configs.append(BucketConfig(name=name, patterns=non_routed_fqns))
+        if tp_enabled:
+            dp_only_fqns = tuple(
+                fqn
+                for fqn in non_routed_fqns
+                if compute_sharding_by_fqn[fqn]
+                in (per_query_head, kv_latent_and_rope, per_key_value_head)
+            )
+            joint_dp_tp_fqns = tuple(
+                fqn for fqn in non_routed_fqns if fqn not in dp_only_fqns
+            )
+            bucket_configs.extend(
+                (
+                    BucketConfig(name=name, patterns=joint_dp_tp_fqns),
+                    BucketConfig(name=f"{name}.dp-only", patterns=dp_only_fqns),
+                )
+            )
+        else:
+            bucket_configs.append(BucketConfig(name=name, patterns=non_routed_fqns))
         if routed_fqns:
             bucket_configs.append(
                 BucketConfig(name=f"{name}.routed-experts", patterns=routed_fqns)
@@ -437,11 +471,25 @@ def _dist_muon_optimizer(
         r"moe\.shared_experts\.(?:w13|w2)\.weight"
         r")$"
     )
+    return compute_sharding_by_fqn, tuple(bucket_configs), muon_pattern
+
+
+def _dist_muon_optimizer(
+    model_config: KimiK25Model.Config,
+    *,
+    muon_lr: float,
+    adamw_lr: float,
+    parallelism: ParallelismConfig,
+) -> OptimizersContainer.Config:
+    compute_sharding_by_fqn, bucket_configs, muon_pattern = _dist_muon_compute_config(
+        model_config,
+        parallelism=parallelism,
+    )
     return OptimizersContainer.Config(
         optimizers=[
             DistMuon.Config(
                 pattern=muon_pattern,
-                bucket_configs=tuple(bucket_configs),
+                bucket_configs=bucket_configs,
                 compute_sharding_by_fqn=compute_sharding_by_fqn,
                 lr=muon_lr,
                 weight_decay=0.1,
@@ -456,7 +504,10 @@ def _dist_muon_optimizer(
                 pattern=r".*",
                 foreach=True,
                 fused=False,
-                **adamw_kwargs,
+                lr=adamw_lr,
+                betas=(0.9, 0.95),
+                eps=1e-8,
+                weight_decay=0.1,
             ),
         ],
     )
@@ -517,23 +568,56 @@ def _align_dist_muon_expert_compute_layouts(
     )
 
 
+def _align_kimi_k2_dist_muon_compute_config(
+    optimizer_config: OptimizersContainer.Config,
+    *,
+    model_config: KimiK25Model.Config,
+    parallelism: ParallelismConfig,
+) -> OptimizersContainer.Config:
+    """Rebuild Kimi K2 layouts and buckets after CLI parallelism overrides."""
+    dist_muon_index = next(
+        (
+            index
+            for index, config in enumerate(optimizer_config.optimizers)
+            if isinstance(config, DistMuon.Config)
+        ),
+        None,
+    )
+    if dist_muon_index is None:
+        return optimizer_config
+
+    compute_sharding_by_fqn, bucket_configs, _muon_pattern = _dist_muon_compute_config(
+        model_config,
+        parallelism=parallelism,
+    )
+    dist_muon_config = cast(
+        DistMuon.Config,
+        optimizer_config.optimizers[dist_muon_index],
+    )
+    if (
+        dist_muon_config.compute_sharding_by_fqn == compute_sharding_by_fqn
+        and dist_muon_config.bucket_configs == bucket_configs
+    ):
+        return optimizer_config
+
+    optimizers = list(optimizer_config.optimizers)
+    optimizers[dist_muon_index] = replace(
+        dist_muon_config,
+        compute_sharding_by_fqn=compute_sharding_by_fqn,
+        bucket_configs=bucket_configs,
+    )
+    return replace(optimizer_config, optimizers=optimizers)
+
+
 @dataclass(kw_only=True, slots=True)
 class _KimiTrainerConfig(Trainer.Config):
     def __post_init__(self) -> None:
         Trainer.Config.__post_init__(self)
-        self.optimizer = _align_dist_muon_expert_compute_layouts(
+        self.optimizer = _align_kimi_k2_dist_muon_compute_config(
             self.optimizer,
+            model_config=cast(KimiK25Model.Config, self.model),
             parallelism=self.parallelism,
         )
-        # TODO(#3353): Support TP-produced _StridedShard layouts in DistMuon.
-        if self.parallelism.tensor_parallel_degree > 1:
-            # Fail during config parsing, before TP/FSDP creates _StridedShard
-            # storage.
-            raise ValueError(
-                "Kimi DistMuon currently requires "
-                "tensor_parallel_degree=1: tensor parallelism can produce "
-                "unsupported _StridedShard parameter layouts."
-            )
         # No PP gate: DistMuon is PP-safe. The one precondition -- every stage
         # must own at least one transformer layer, or its Muon pattern claims
         # nothing and OptimizersContainer rejects the empty param group -- needs
