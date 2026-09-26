@@ -23,7 +23,7 @@ from torchtitan.components.optimizer import (
     LRSchedulersContainer,
     OptimizersContainer,
 )
-from torchtitan.config import CompileConfig, TrainingConfig
+from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import NVFP4LinearConverter
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
@@ -80,9 +80,6 @@ def qwen3_debugmodel_nvfp4(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
 ) -> Trainer.Config:
     config = qwen3_debugmodel(seq_len=seq_len)
-    model_compile_enabled = (
-        config.compile is not None and "model" in config.compile.components
-    )
     # Convert every decoder-layer Linear while leaving the lm_head in bf16.
     config.model = model_registry(
         "debugmodel",
@@ -90,7 +87,6 @@ def qwen3_debugmodel_nvfp4(
         converters=[
             NVFP4LinearConverter.Config(
                 fqns=["layers"],
-                model_compile_enabled=model_compile_enabled,
             ),
         ],
     )
@@ -102,9 +98,6 @@ def qwen3_debugmodel_first_85_pct_layers_nvfp4(
 ) -> Trainer.Config:
     config = qwen3_debugmodel(seq_len=seq_len)
     assert config.model is not None
-    model_compile_enabled = (
-        config.compile is not None and "model" in config.compile.components
-    )
     # Keep the last 15% of decoder layers and the lm_head in bf16.
     num_layers = len(cast(Qwen3Model.Config, config.model).layers)
     _NVFP4_BF16_TAIL_FRACTION = 0.15
@@ -118,7 +111,6 @@ def qwen3_debugmodel_first_85_pct_layers_nvfp4(
         converters=[
             NVFP4LinearConverter.Config(
                 fqns=fqns,
-                model_compile_enabled=model_compile_enabled,
             ),
         ],
     )
@@ -252,7 +244,6 @@ def qwen3_1_7b(seq_len: int | None = None) -> Trainer.Config:
 def qwen3_8b_first_85_pct_layers_nvfp4(seq_len: int | None = None) -> Trainer.Config:
     config = sft_qwen3_8b_math(seq_len=seq_len)
     assert config.model is not None
-    config.compile = CompileConfig(components=["model"])
     # Keep the last 15% of decoder layers and the lm_head in bf16.
     num_layers = len(cast(Qwen3Model.Config, config.model).layers)
     _NVFP4_BF16_TAIL_FRACTION = 0.15
@@ -267,7 +258,6 @@ def qwen3_8b_first_85_pct_layers_nvfp4(seq_len: int | None = None) -> Trainer.Co
         converters=[
             NVFP4LinearConverter.Config(
                 fqns=fqns,
-                model_compile_enabled=True,
             ),
         ],
     )
