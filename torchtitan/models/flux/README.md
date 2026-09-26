@@ -42,7 +42,7 @@ MODULE=flux CONFIG=flux_schnell ./run_train.sh
 The loss function can be compiled independently with:
 
 ```python
-config.compile = CompileConfig(components=["loss"])
+config.compile = CompileConfig(local_compile=["loss"])
 ```
 
 The model itself is not compiled by the standard Trainer.

@@ -197,7 +197,7 @@ def deepseek_v3_16b(seq_len: int | None = None) -> Trainer.Config:
         ),
         checkpointer=None,
         activation_checkpoint=SelectiveAC.Config(),
-        compile=CompileConfig(components=["loss"]),
+        compile=CompileConfig(local_compile=["gated_rmsnorm", "loss"]),
     )
 
 
@@ -254,7 +254,7 @@ def deepseek_v3_671b(seq_len: int | None = None) -> Trainer.Config:
         ),
         checkpointer=None,
         activation_checkpoint=SelectiveAC.Config(),
-        compile=CompileConfig(components=["loss"]),
+        compile=CompileConfig(local_compile=["gated_rmsnorm", "loss"]),
     )
 
 

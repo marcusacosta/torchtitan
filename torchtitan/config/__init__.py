@@ -15,6 +15,7 @@ TORCH_DTYPE_MAP = {
 from .configs import CommConfig, CompileConfig, DebugConfig, TrainingConfig
 from .configurable import Configurable
 from .function import Function
+from .local_compile import configure_local_compile_functions, local_compile
 from .manager import ConfigManager
 from .override import (
     apply_overrides,
@@ -29,6 +30,8 @@ __all__ = [
     "ConfigManager",
     "Configurable",
     "Function",
+    "configure_local_compile_functions",
+    "local_compile",
     "TORCH_DTYPE_MAP",
     # Config dataclasses
     "CompileConfig",

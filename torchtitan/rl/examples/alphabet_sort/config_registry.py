@@ -107,7 +107,7 @@ def rl_grpo_qwen3_0_6b_varlen() -> Controller.Config:
             num_samples_per_prompt=num_samples_per_prompt,
             validation=ValidationConfig(num_samples=20),
         ),
-        compile=CompileConfig(backend="aot_eager"),
+        compile=CompileConfig(local_compile=["loss"], backend="aot_eager"),
         rollouter=_alphabet_sort_rollouter_config(),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
         generator_router=InterGeneratorRouter.Config(
@@ -191,7 +191,7 @@ def rl_grpo_qwen3_0_6b_flex() -> Controller.Config:
             num_samples_per_prompt=num_samples_per_prompt,
             validation=ValidationConfig(num_samples=20),
         ),
-        compile=CompileConfig(backend="aot_eager"),
+        compile=CompileConfig(local_compile=["loss"], backend="aot_eager"),
         rollouter=_alphabet_sort_rollouter_config(),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
         metrics=MetricsProcessor.Config(enable_wandb=True),
@@ -298,7 +298,7 @@ def rl_grpo_gpt_oss_20b_varlen() -> Controller.Config:
             num_samples_per_prompt=num_samples_per_prompt,
             validation=ValidationConfig(num_samples=20),
         ),
-        compile=CompileConfig(backend="aot_eager"),
+        compile=CompileConfig(local_compile=["loss"], backend="aot_eager"),
         rollouter=_alphabet_sort_rollouter_config(),
         renderer=from_renderers(GptOssRendererConfig(reasoning_effort="low")),
         generator_router=InterGeneratorRouter.Config(
@@ -371,7 +371,7 @@ def rl_grpo_gpt_oss_debug_varlen() -> Controller.Config:
                 drop_zero_std_reward_groups=False,
             ),
         ),
-        compile=CompileConfig(backend="aot_eager"),
+        compile=CompileConfig(local_compile=["loss"], backend="aot_eager"),
         rollouter=_alphabet_sort_rollouter_config(),
         # Debug tokenizer (vocab 2048, matches debugmodel); the gpt_oss renderer
         # needs gpt-oss special tokens absent here, so use the qwen3 renderer
@@ -453,7 +453,7 @@ def rl_grpo_gpt_oss_debug_varlen_batch_invariant() -> Controller.Config:
                 drop_zero_std_reward_groups=False,
             ),
         ),
-        compile=CompileConfig(backend="aot_eager"),
+        compile=CompileConfig(local_compile=["loss"], backend="aot_eager"),
         rollouter=_alphabet_sort_rollouter_config(),
         # Debug tokenizer (vocab 2048, matches debugmodel); the gpt_oss renderer
         # needs gpt-oss special tokens absent here, so use the qwen3 renderer
@@ -525,7 +525,7 @@ def rl_grpo_qwen3_1_7b() -> Controller.Config:
             num_samples_per_prompt=num_samples_per_prompt,
             validation=ValidationConfig(num_samples=20),
         ),
-        compile=CompileConfig(backend="aot_eager"),
+        compile=CompileConfig(local_compile=["loss"], backend="aot_eager"),
         rollouter=_alphabet_sort_rollouter_config(),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
         metrics=MetricsProcessor.Config(enable_wandb=True),
@@ -590,7 +590,7 @@ def rl_grpo_qwen3_14b() -> Controller.Config:
             num_samples_per_prompt=num_samples_per_prompt,
             validation=ValidationConfig(num_samples=20),
         ),
-        compile=CompileConfig(backend="aot_eager"),
+        compile=CompileConfig(local_compile=["loss"], backend="aot_eager"),
         rollouter=_alphabet_sort_rollouter_config(),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
         metrics=MetricsProcessor.Config(enable_wandb=True),
@@ -1002,7 +1002,7 @@ def rl_grpo_qwen3_0_6b_varlen_batch_invariant() -> Controller.Config:
             num_samples_per_prompt=num_samples_per_prompt,
             validation=ValidationConfig(num_samples=20),
         ),
-        compile=CompileConfig(backend="aot_eager"),
+        compile=CompileConfig(local_compile=["loss"], backend="aot_eager"),
         rollouter=_alphabet_sort_rollouter_config(),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
         metrics=MetricsProcessor.Config(enable_wandb=True),

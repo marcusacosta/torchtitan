@@ -63,6 +63,9 @@ class EpOverlapConfig:
 
 @dataclass(kw_only=True, slots=True)
 class GraphTrainerCompileConfig(CompileConfig):
+    local_compile: list[str] = field(default_factory=list)
+    """Disable nested local compilation inside the whole-step graph."""
+
     enable_async_tensor_parallel: bool = False
     """Whether to pipeline tensor-parallel collectives with matrix multiplications."""
 

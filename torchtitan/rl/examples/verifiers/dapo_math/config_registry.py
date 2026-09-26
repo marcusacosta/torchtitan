@@ -119,7 +119,7 @@ def _qwen3_4b_verifiers_config(
             target_offpolicy_steps=4,
             validation=ValidationConfig(num_samples=num_validation_samples),
         ),
-        compile=CompileConfig(backend="aot_eager"),
+        compile=CompileConfig(local_compile=["loss"], backend="aot_eager"),
         rollouter=_verifiers_math_rollouter_config(max_rollout_tokens=max_total_tokens),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=True)),
         num_generators=6,

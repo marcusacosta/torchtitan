@@ -94,7 +94,7 @@ def _qwen3_4b_dapo_math_config(
                 num_samples=num_validation_samples,
             ),
         ),
-        compile=CompileConfig(backend="aot_eager"),
+        compile=CompileConfig(local_compile=["loss"], backend="aot_eager"),
         rollouter=_dapo_math_rollouter_config(
             validation_dataset=validation_dataset,
             token_env=TokenEnv.Config(

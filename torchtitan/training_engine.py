@@ -30,6 +30,7 @@ from torchtitan.config.configs import (
     DebugConfig,
     TrainingConfig,
 )
+from torchtitan.config.local_compile import configure_local_compile_functions
 from torchtitan.config.override import OverrideConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import ParallelismContext, utils as dist_utils
@@ -238,6 +239,12 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         create_seed_checkpoint: bool = False,
     ) -> None:
         """Initialize model execution and the state required to train it."""
+        # Decorators register at import time; bind their implementations here,
+        # once runtime config is available and before building the loss and model.
+        configure_local_compile_functions(
+            compile_config,
+            self.config.debug.batch_invariant,
+        )
         self._initialize_model(
             compile_config=compile_config,
             hf_assets_path=hf_assets_path,

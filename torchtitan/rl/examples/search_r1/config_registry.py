@@ -95,7 +95,7 @@ def rl_grpo_qwen3_1_7b_search_r1() -> Controller.Config:
             num_samples_per_prompt=8,
             validation=ValidationConfig(num_samples=500),
         ),
-        compile=CompileConfig(backend="aot_eager"),
+        compile=CompileConfig(local_compile=["loss"], backend="aot_eager"),
         rollouter=_search_r1_rollouter_config(),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
         metrics=MetricsProcessor.Config(enable_wandb=True),

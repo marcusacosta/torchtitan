@@ -221,7 +221,7 @@ def kimi_vl_a3b(seq_len: int | None = None) -> Trainer.Config:
 
 def kimi_k2_5(seq_len: int | None = None) -> Trainer.Config:
     """Full Kimi K2.5 (~1T-total / ~32B-active)."""
-    compile_config = CompileConfig(components=["loss"])
+    compile_config = CompileConfig(local_compile=["gated_rmsnorm", "loss"])
     # The report uses BF16 compute; its FP8 path only compresses saved activations.
     model_config = model_registry(
         "Kimi-K2.5", enable_sp=True, seq_len=seq_len, attn_backend="flex"

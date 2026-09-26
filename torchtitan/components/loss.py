@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -17,19 +16,17 @@ import torch.distributed._functional_collectives as funcol
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torchtitan.config import CompileConfig, Configurable
+from torchtitan.config import CompileConfig, Configurable, local_compile
 from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 
 # PyTorch's default ignore index for cross-entropy loss
-logger = logging.getLogger(__name__)
-
-
 IGNORE_INDEX = -100
 
 LossFunction: TypeAlias = Callable[..., torch.Tensor]
 
 
+@local_compile("loss", batch_invariant=False)
 def cross_entropy_loss(
     pred: torch.Tensor,
     labels: torch.Tensor,
@@ -269,6 +266,7 @@ class _VocabParallelEntropy(torch.autograd.Function):
         return torch.log(sumexp) - weighted_sum / sumexp
 
 
+@local_compile("loss", batch_invariant=False)
 def mse_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """MSE loss with sum reduction for Transformer models training."""
     return torch.nn.functional.mse_loss(
@@ -294,11 +292,6 @@ class BaseLoss(ABC, Configurable):
     @abstractmethod
     def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
         ...
-
-    def _maybe_compile(self, compile_config: CompileConfig | None) -> None:
-        if compile_config is not None and "loss" in compile_config.components:
-            logger.info("Compiling the loss function with torch.compile")
-            self.fn = torch.compile(self.fn, backend=compile_config.backend)
 
     def __call__(
         self,
@@ -332,8 +325,8 @@ class CrossEntropyLoss(BaseLoss):
         """Full vocabulary size, needed for spmd_types loss-parallel CE."""
 
     def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
+        del compile_config
         self.fn: LossFunction = cross_entropy_loss
-        self._maybe_compile(compile_config)
         self.global_vocab_size = config.global_vocab_size
 
     def __call__(
@@ -366,8 +359,8 @@ class MSELoss(BaseLoss):
         pass
 
     def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
+        del compile_config
         self.fn: LossFunction = mse_loss
-        self._maybe_compile(compile_config)
 
 
 def compute_logprobs(

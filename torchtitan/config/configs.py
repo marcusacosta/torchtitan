@@ -120,19 +120,13 @@ class TrainingConfig:
 
 @dataclass(kw_only=True, slots=True)
 class CompileConfig:
-    components: list[str] = field(default_factory=lambda: ["loss"])
-    """Non-model components to compile."""
+    local_compile: list[str] = field(default_factory=lambda: ["gated_rmsnorm"])
+    """Functions to compile independently with ``torch.compile``.
+
+    Gated RMSNorm is enabled by default; loss compilation is opt-in.
+    """
 
     backend: str = "inductor"
-
-    def __post_init__(self) -> None:
-        allowed = frozenset({"loss"})
-        unknown = [c for c in self.components if c not in allowed]
-        if unknown:
-            raise ValueError(
-                f"Unknown compile.components entries {unknown}; "
-                f"allowed values are {sorted(allowed)}"
-            )
 
 
 @dataclass(kw_only=True, slots=True)

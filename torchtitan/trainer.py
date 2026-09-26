@@ -73,7 +73,9 @@ class Trainer(Configurable):
             default_factory=HuggingFaceTokenizer.Config
         )
         dataloader: BaseDataLoader.Config = field(default_factory=BaseDataLoader.Config)
-        compile: Annotated[CompileConfig | None, tyro.conf.AvoidSubcommands] = None
+        compile: Annotated[CompileConfig | None, tyro.conf.AvoidSubcommands] = field(
+            default_factory=CompileConfig
+        )
         validator: Annotated[Validator.Config | None, tyro.conf.AvoidSubcommands] = None
         dump_folder: str = "./outputs"
 

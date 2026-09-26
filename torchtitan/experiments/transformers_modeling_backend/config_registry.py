@@ -79,7 +79,7 @@ def transformers_modeling_backend_debugmodel_compile(
     seq_len: int = DEFAULT_DEBUG_MODEL_SEQ_LEN,
 ) -> TransformersBackendConfig:
     config = transformers_modeling_backend_debugmodel(seq_len=seq_len)
-    config.compile = CompileConfig()
+    config.compile = CompileConfig(local_compile=["gated_rmsnorm", "loss"])
     return config
 
 
@@ -123,7 +123,7 @@ def transformers_modeling_backend_debugmodel_moe_compile(
     seq_len: int = DEFAULT_DEBUG_MODEL_SEQ_LEN,
 ) -> TransformersBackendConfig:
     config = transformers_modeling_backend_debugmodel_moe(seq_len=seq_len)
-    config.compile = CompileConfig()
+    config.compile = CompileConfig(local_compile=["gated_rmsnorm", "loss"])
     return config
 
 
