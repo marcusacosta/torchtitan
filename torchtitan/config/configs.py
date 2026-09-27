@@ -21,13 +21,15 @@ Most knobs belong to a component or to the model, not here. But some options
 have no suitable home, e.g. the training token-budget settings, and those can
 be placed here. Discuss with the maintainers first if you intend to add one.
 
-The command-line surface is frozen either way, so annotate a new field with
-``tyro.conf.Suppress``, as ``Trainer.Config.model`` does. See
+Configuration is provided by Python recipe functions. See
 ``torchtitan/config/README.md``.
 """
 
 from dataclasses import dataclass, field
 from typing import Literal
+
+
+CommBackend = Literal["default", "fake", "real_pp_fake_spmd"]
 
 
 @dataclass(kw_only=True, slots=True)
@@ -137,7 +139,7 @@ class CompileConfig:
                 f"allowed values are {sorted(allowed)}"
             )
         if self.enable_async_tensor_parallel and "model" not in self.components:
-            raise ValueError("Async TP requires 'model' in --compile.components.")
+            raise ValueError("Async TP requires 'model' in compile.components.")
 
 
 @dataclass(kw_only=True, slots=True)
@@ -160,7 +162,7 @@ class CommConfig:
     save_traces_file_prefix: str = "rank_"
     """Flight recorder trace files prefix"""
 
-    backend: Literal["default", "fake", "real_pp_fake_spmd"] = "default"
+    backend: CommBackend = "default"
     """Communication topology used for training or distributed debugging.
 
     Options:
@@ -192,9 +194,6 @@ class DebugConfig:
 
     deterministic_warn_only: bool = False
     """Only warns about ops without deterministic implementations rather than erroring out  """
-
-    moe_force_load_balance: bool = False
-    """If True, we force each experts to get the same amount of tokens via round-robin. This option is for debugging usage only."""
 
     detect_anomaly: bool = False
     """Enable torch.autograd anomaly detection to help track down NaN/Inf gradients.
