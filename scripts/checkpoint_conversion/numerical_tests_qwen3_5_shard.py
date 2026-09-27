@@ -29,7 +29,7 @@ from torchtitan.config import CompileConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.models.qwen3_5 import model_registry, Qwen35Model
+from torchtitan.models.qwen3_5 import build_model_config, Qwen35Model
 from torchtitan.tools import utils
 
 CONFIGS = [
@@ -54,7 +54,7 @@ def run_worker(args):
     torch.cuda.manual_seed(seed)
 
     seq_len = 128
-    config = model_registry(
+    config = build_model_config(
         "debugmodel_moe", attn_backend="flex", enable_sp=True, seq_len=seq_len
     )
 

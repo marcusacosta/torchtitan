@@ -11,7 +11,7 @@ import torch
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
-from torchtitan.models.qwen3 import model_registry
+from torchtitan.models.qwen3 import build_model_config
 from torchtitan.trainer import Trainer
 
 
@@ -29,7 +29,7 @@ class TestTokenDispatcherModule(unittest.TestCase):
 class TestExpertParallelConfigValidation(unittest.TestCase):
     @staticmethod
     def _config(ep: int, tp: int = 1):
-        model_config = model_registry("debugmodel_moe")
+        model_config = build_model_config("debugmodel_moe")
         runtime_config = Trainer.Config(
             model=model_config,
             training=TrainingConfig(
@@ -83,7 +83,7 @@ class TestExpertParallelConfigValidation(unittest.TestCase):
         self.assertTrue(runtime_config.parallelism.enable_sequence_parallel)
 
     def test_dense_tensor_parallel_does_not_require_expert_parallel(self):
-        model_config = model_registry("debugmodel")
+        model_config = build_model_config("debugmodel")
         runtime_config = Trainer.Config(
             model=model_config,
             training=TrainingConfig(

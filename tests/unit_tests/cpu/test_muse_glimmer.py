@@ -11,7 +11,7 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 from torchtitan.models.common.attention import FlexInnerAttention
-from torchtitan.models.muse_glimmer import model_registry
+from torchtitan.models.muse_glimmer import build_model_config
 
 
 class TestMuseGlimmerConditionalVision(unittest.TestCase):
@@ -28,7 +28,7 @@ class TestMuseGlimmerConditionalVision(unittest.TestCase):
                 SimpleNamespace(),
             )
 
-        model = model_registry("debugmodel_mm", seq_len=8).build()
+        model = build_model_config("debugmodel_mm", seq_len=8).build()
         model.init_states()
         hidden_TD = torch.randn(4, model.config.dim, requires_grad=True)
         encoder_outputs = []

@@ -320,9 +320,7 @@ def test_trainer_requires_prefix_cache_reset_when_hotswap_off():
     # Strict drain (hot_swap=False) needs the prefix cache reset so post-pull requests don't reuse old-weight KV.
     import dataclasses
 
-    from torchtitan.rl.examples.alphabet_sort.config_registry import (
-        rl_grpo_qwen3_0_6b_varlen,
-    )
+    from torchtitan_recipes.rl.alphabet_sort import rl_grpo_qwen3_0_6b_varlen
 
     config = rl_grpo_qwen3_0_6b_varlen()
     # hot_swap defaults True; the guard fires only in drain mode (hot_swap=False) with reset also off.
@@ -339,12 +337,12 @@ def test_trainer_requires_prefix_cache_reset_when_hotswap_off():
 
 
 def test_qwen36_27b_config_applies_offset_rmsnorm_to_both_actors():
-    from torchtitan.rl.examples.alphabet_sort.config_registry import (
-        rl_grpo_qwen3_6_27b_varlen_perf,
-    )
+    from torchtitan_recipes.rl.alphabet_sort import rl_grpo_qwen3_6_27b_varlen_perf
 
     config = rl_grpo_qwen3_6_27b_varlen_perf()
-    override_import = "torchtitan.overrides.offset_rmsnorm.triton_offset_rmsnorm"
+    override_import = (
+        "torchtitan_recipes.overrides.offset_rmsnorm.triton_offset_rmsnorm"
+    )
 
     assert config.hf_assets_path.endswith("Qwen3.6-27B")
     assert config.trainer.override.imports == [override_import]
@@ -557,9 +555,7 @@ def test_vllm_uneven_decode_tp_padding():
     if world_size != 4:
         pytest.skip(f"requires exactly 4 GPUs, got {world_size}")
 
-    from torchtitan.rl.examples.alphabet_sort.config_registry import (
-        rl_grpo_qwen3_moe_debug_varlen,
-    )
+    from torchtitan_recipes.rl.alphabet_sort import rl_grpo_qwen3_moe_debug_varlen
 
     from tests.unit_tests.rl.test_bitwise_parity import (
         _make_prompt_tokens,

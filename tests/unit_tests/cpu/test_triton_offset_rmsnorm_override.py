@@ -12,16 +12,16 @@ import torch
 from torchtitan.config import apply_overrides, OverrideConfig
 from torchtitan.config.override import _REGISTRY
 from torchtitan.models.common.decoder_sharding import dense_param_placement
-from torchtitan.models.qwen3_5 import model_registry
+from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.models.qwen3_5.model import OffsetRMSNorm
-from torchtitan.overrides.offset_rmsnorm import (
+from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan_recipes.overrides.offset_rmsnorm import (
     triton_offset_rmsnorm,
     TritonOffsetRMSNorm,
 )
-from torchtitan.protocols.sharding import ShardingConfig
 
 
-_OVERRIDE_TARGET = "torchtitan.overrides.offset_rmsnorm.triton_offset_rmsnorm"
+_OVERRIDE_TARGET = "torchtitan_recipes.overrides.offset_rmsnorm.triton_offset_rmsnorm"
 _OFFSET_RMSNORM_OVERRIDE = _REGISTRY[_OVERRIDE_TARGET]
 
 
@@ -30,12 +30,15 @@ class TestTritonOffsetRMSNormOverride(unittest.TestCase):
         _REGISTRY.setdefault(_OVERRIDE_TARGET, _OFFSET_RMSNORM_OVERRIDE)
 
     def test_override_replaces_all_qwen35_offset_norms(self):
-        config = model_registry("debugmodel", enable_sp=True, attn_backend="flex")
+        config = build_model_config("debugmodel", enable_sp=True, attn_backend="flex")
         num_offset_norms = len(list(config.traverse(OffsetRMSNorm.Config)))
 
         replacements = apply_overrides(
             OverrideConfig(
-                imports=["torchtitan.overrides.offset_rmsnorm." "triton_offset_rmsnorm"]
+                imports=[
+                    "torchtitan_recipes.overrides.offset_rmsnorm."
+                    "triton_offset_rmsnorm"
+                ]
             ),
             config,
         )

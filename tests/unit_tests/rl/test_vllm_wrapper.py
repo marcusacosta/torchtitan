@@ -19,7 +19,7 @@ from torchtitan.models.common.attention import QKVLinear
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import GroupedLinear, Linear
-from torchtitan.models.qwen3_5 import model_registry
+from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.models.qwen3_5.model import Qwen35Model
 from torchtitan.models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
 from torchtitan.protocols.sharding import ShardingConfig
@@ -130,7 +130,7 @@ def _check_hf_adapter_restores_local_shards(rank: int, rendezvous: str) -> None:
     )
     try:
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("tp",))
-        model_config = model_registry(
+        model_config = build_model_config(
             "0.8B", enable_sp=True, seq_len=256, attn_backend="varlen"
         )
         assert isinstance(model_config, Qwen35Model.Config)
