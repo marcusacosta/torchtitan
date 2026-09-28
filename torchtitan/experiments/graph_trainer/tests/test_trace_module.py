@@ -245,7 +245,7 @@ class TestGraphGradientAccumulation(unittest.TestCase):
                 num_tokens_per_microbatch_per_dp_rank=1,
             ),
         )
-        engine.parallel_dims = SimpleNamespace(pp_enabled=False, cp=1)
+        engine.parallelism_context = SimpleNamespace(pp_enabled=False, cp=1)
         engine.model_parts = [model]
         engine.device = torch.device("cpu")
         engine.max_num_documents = None
@@ -1096,7 +1096,7 @@ class TestReparametrizeOptimizer(unittest.TestCase):
     DTYPE = torch.float32
 
     def test_titan_optimizers_container(self):
-        from torchtitan.components.optimizer import AdamW, OptimizersContainer
+        from torchtitan.components.optimization import AdamW, OptimizersContainer
 
         torch.manual_seed(0)
         model = SimpleMLP().to(device=self.DEVICE, dtype=self.DTYPE)

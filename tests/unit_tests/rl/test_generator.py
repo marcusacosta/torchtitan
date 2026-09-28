@@ -28,7 +28,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from torchtitan.components.optimizer import AdamW
+from torchtitan.components.optimization import AdamW
 from torchtitan.config import CommConfig, DebugConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC

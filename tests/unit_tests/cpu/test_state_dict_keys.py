@@ -33,8 +33,8 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 
 from torchtitan.components.checkpointer import ModelWrapper
-from torchtitan.components.optimizer import AdamW, OptimizersContainer
-from torchtitan.components.optimizer.utils import (
+from torchtitan.components.optimization import AdamW, OptimizersContainer
+from torchtitan.components.optimization.utils import (
     get_flat_optim_state_dict,
     init_optim_state,
     load_flat_optim_state_dict,
@@ -106,7 +106,7 @@ class TestStateDictKeys(unittest.TestCase):
         # module first, in a fresh interpreter, must not close an import cycle.
         for module, names in (
             (
-                "torchtitan.components.optimizer.utils",
+                "torchtitan.components.optimization.utils",
                 "get_flat_optim_state_dict, init_optim_state, "
                 "load_flat_optim_state_dict",
             ),
