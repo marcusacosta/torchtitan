@@ -16,7 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_remat as remat
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.optim import Optimizer
 
 from torchtitan.distributed import ParallelismContext
@@ -277,14 +276,14 @@ class TokenChoiceTopKRouter(Module):
         if self._debug_force_load_balance:
             topk_expert_ids_TK, topk_scores_TK = remat.region(
                 self._debug_force_load_balance_routing,
-                "routing_decision",
+                self.remat_region_name("routing_decision"),
                 recompute=False,
             )(scores_TE)
             remat.recompute_needs_tensor(topk_expert_ids_TK, topk_scores_TK)
         else:
             topk_expert_ids_TK = remat.region(
                 self._select_experts,
-                "routing_decision",
+                self.remat_region_name("routing_decision"),
                 recompute=False,
             )(
                 scores_TE,
@@ -898,10 +897,6 @@ def register_moe_load_balancing_hook(
                 )
         return load_balance_enabled
 
-    # for MoE auxiliary-loss-free load balancing
-    def _is_recomputation_enabled(module):
-        return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
-
     def _update_expert_bias(
         model_parts: list[nn.Module],
         parallelism_context: ParallelismContext,
@@ -912,12 +907,6 @@ def register_moe_load_balancing_hook(
         tokens_per_expert_E_list = []
         for transformer_block, moe in _iter_moe_layers(model_parts):
             tokens_per_expert_E = moe.router.tokens_per_expert_E
-            if _is_recomputation_enabled(transformer_block):
-                # TODO: This is a hack, we assume with full AC, the tokens_per_expert_E is counted twice.
-                # This does not affect to expert choice, but affects the experts usage metrics.
-                # We divide by 2 to correct for this double-counting due to recomputation
-                # TODO: new API to help determine if AC is enabled https://github.com/pytorch/pytorch/pull/160888
-                tokens_per_expert_E = tokens_per_expert_E // 2
             tokens_per_expert_E_list.append(tokens_per_expert_E)
 
         if not tokens_per_expert_E_list:
