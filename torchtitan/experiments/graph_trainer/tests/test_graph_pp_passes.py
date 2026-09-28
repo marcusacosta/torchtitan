@@ -47,7 +47,8 @@ from torchtitan.experiments.graph_trainer.fsdp_patterns import (
     find_fsdp_unshard_save_nodes,
 )
 from torchtitan.experiments.graph_trainer.graph_builder import (
-    _defer_fsdp_action_bucketing,
+    _configure_fsdp_bucketing_pass,
+    _extract_fsdp_bucketing_pass,
 )
 from torchtitan.experiments.graph_trainer.graph_pp import (
     extract_fsdp_reduce_grad_graph,
@@ -1765,26 +1766,28 @@ class GraphPPActionBucketingTest(unittest.TestCase):
                 ]
                 original_pass = passes[0]
                 if extract_unshard or extract_reduce_grad:
-                    configured_passes = _defer_fsdp_action_bucketing(
-                        passes,
+                    bucketing_pass = _extract_fsdp_bucketing_pass(passes)
+                    self.assertIs(bucketing_pass, original_pass)
+                    configured_pass = _configure_fsdp_bucketing_pass(
+                        bucketing_pass,
                         bucket_all_gathers=not extract_unshard,
                         bucket_reduce_scatters=not extract_reduce_grad,
                         bucket_all_reduces=not extract_reduce_grad,
                     )
                     if extract_unshard and extract_reduce_grad:
-                        self.assertEqual(configured_passes, [])
+                        self.assertIsNone(configured_pass)
                     else:
-                        self.assertEqual(len(configured_passes), 1)
+                        assert isinstance(configured_pass, functools.partial)
                         self.assertEqual(
-                            configured_passes[0].keywords["bucket_all_gathers"],
+                            configured_pass.keywords["bucket_all_gathers"],
                             not extract_unshard,
                         )
                         self.assertEqual(
-                            configured_passes[0].keywords["bucket_reduce_scatters"],
+                            configured_pass.keywords["bucket_reduce_scatters"],
                             not extract_reduce_grad,
                         )
                         self.assertEqual(
-                            configured_passes[0].keywords["bucket_all_reduces"],
+                            configured_pass.keywords["bucket_all_reduces"],
                             not extract_reduce_grad,
                         )
                 else:
@@ -1872,6 +1875,23 @@ class GraphPPFSDPCollectiveSplitTest(unittest.TestCase):
         self.assertEqual(
             {node.args[2] for node in compute_all_gathers},
             {_FAKE_PG_2},
+        )
+
+        split_with_expert = extract_fsdp_unshard_graph(
+            _make_forward_graph_with_dense_and_expert_unshards(),
+            num_params=3,
+            input_names=("dense_param_0", "dense_param_1", "expert_param"),
+            flat_input_indices=(0, 1, 2),
+            include_expert_fsdp=True,
+        )
+        self.assertEqual(
+            len(
+                split_with_expert.compute_module.graph.find_nodes(
+                    op="call_function",
+                    target=torch.ops._c10d_functional.all_gather_into_tensor.default,
+                )
+            ),
+            0,
         )
 
         with (
@@ -2348,6 +2368,20 @@ class GraphPPFSDPCollectiveSplitTest(unittest.TestCase):
         )
         self.assertIn(
             torch.ops._c10d_functional.all_reduce.default,
+            _call_targets(split.reduce_grad_module),
+        )
+
+        split = extract_fsdp_reduce_grad_graph(
+            gm,
+            num_param_grads=3,
+            include_expert_fsdp=True,
+        )
+        self.assertNotIn(
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            _call_targets(split.compute_module),
+        )
+        self.assertIn(
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
             _call_targets(split.reduce_grad_module),
         )
 

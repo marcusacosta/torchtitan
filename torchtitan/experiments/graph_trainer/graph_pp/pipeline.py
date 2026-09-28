@@ -46,10 +46,12 @@ from torchtitan.experiments.graph_trainer.graph_pp.runner import (
     BACKWARD,
     BACKWARD_WEIGHT_WITH_REDUCE_GRAD,
     BACKWARD_WITH_REDUCE_GRAD,
-    FULL_FORWARD_BACKWARD,
+    FORWARD_BACKWARD_NOGRADACCUM,
+    FORWARD_BACKWARD_WITH_REDUCE_GRAD,
+    FORWARD_BACKWARD_WITH_UNSHARD,
     GraphRuntime,
+    joint_forward_backward_computation_type,
     register_graph_schedule,
-    ZERO_GRAD_ACCUMS,
 )
 from torchtitan.experiments.graph_trainer.graph_pp.stage import GraphPipelineStage
 from torchtitan.experiments.graph_trainer.registry import (
@@ -69,8 +71,20 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class GraphRuntimeFSDPPolicy:
-    extract_fsdp_param_unshard: bool
-    extract_fsdp_grad_reduction: bool
+    """Place each FSDP boundary in a schedule action or an edge microbatch."""
+
+    schedule_fsdp_param_unshard: bool
+    schedule_fsdp_grad_reduction: bool
+    unshard_in_first_microbatch: bool = False
+    reduce_grad_in_last_microbatch: bool = False
+
+    @property
+    def split_fsdp_param_unshard(self) -> bool:
+        return self.schedule_fsdp_param_unshard or self.unshard_in_first_microbatch
+
+    @property
+    def split_fsdp_grad_reduction(self) -> bool:
+        return self.schedule_fsdp_grad_reduction or self.reduce_grad_in_last_microbatch
 
 
 @dataclass(frozen=True)
@@ -89,44 +103,77 @@ def resolve_graph_runtime_fsdp_policy(
     """Resolve topology-dependent FSDP graph boundaries.
 
     PP=1 keeps FSDP operations in the joint graph for one microbatch and
-    extracts them for gradient accumulation. PP>1 extracts them by default.
+    extracts them for gradient accumulation. Edge-microbatch modes retain the
+    extracted boundary in only the first or last joint graph. PP>1 extracts
+    both boundaries by default.
     """
     if not fsdp_enabled:
-        if compile_config.fsdp_param_unshard_mode == "extracted_in_schedule_stage":
-            raise ValueError("Extracted FSDP parameter unsharding requires FSDP")
-        if compile_config.fsdp_gradient_sync_mode == "deferred_as_schedule_stage":
-            raise ValueError("Deferred FSDP gradient reduction requires FSDP")
+        if compile_config.fsdp_param_unshard_mode not in ("auto", "in_graph"):
+            raise ValueError("Selected FSDP parameter unsharding mode requires FSDP")
+        if compile_config.fsdp_gradient_sync_mode not in ("auto", "in_graph"):
+            raise ValueError("Selected FSDP gradient reduction mode requires FSDP")
         return GraphRuntimeFSDPPolicy(
-            extract_fsdp_param_unshard=False,
-            extract_fsdp_grad_reduction=False,
+            schedule_fsdp_param_unshard=False,
+            schedule_fsdp_grad_reduction=False,
         )
 
     if not pp_enabled:
         has_gradient_accumulation = num_microbatches > 1
+        unshard_in_first_microbatch = (
+            compile_config.fsdp_param_unshard_mode == "in_graph_only_first_mb"
+        )
+        reduce_grad_in_last_microbatch = (
+            compile_config.fsdp_gradient_sync_mode == "in_graph_only_last_mb"
+        )
+        if (
+            unshard_in_first_microbatch or reduce_grad_in_last_microbatch
+        ) and not has_gradient_accumulation:
+            raise ValueError(
+                "First/last-microbatch FSDP modes require gradient accumulation"
+            )
+        if (
+            unshard_in_first_microbatch
+            and compile_config.fsdp_gradient_sync_mode == "in_graph"
+        ) or (
+            reduce_grad_in_last_microbatch
+            and compile_config.fsdp_param_unshard_mode == "in_graph"
+        ):
+            raise ValueError(
+                "First/last-microbatch FSDP boundaries cannot be combined with "
+                "the other boundary inside every joint graph"
+            )
         return GraphRuntimeFSDPPolicy(
-            extract_fsdp_param_unshard=(
+            schedule_fsdp_param_unshard=(
                 compile_config.fsdp_param_unshard_mode == "extracted_in_schedule_stage"
                 or (
                     compile_config.fsdp_param_unshard_mode == "auto"
                     and has_gradient_accumulation
                 )
             ),
-            extract_fsdp_grad_reduction=(
+            schedule_fsdp_grad_reduction=(
                 compile_config.fsdp_gradient_sync_mode == "deferred_as_schedule_stage"
                 or (
                     compile_config.fsdp_gradient_sync_mode == "auto"
                     and has_gradient_accumulation
                 )
             ),
+            unshard_in_first_microbatch=unshard_in_first_microbatch,
+            reduce_grad_in_last_microbatch=reduce_grad_in_last_microbatch,
         )
 
-    if compile_config.fsdp_param_unshard_mode == "in_graph":
+    if compile_config.fsdp_param_unshard_mode in (
+        "in_graph",
+        "in_graph_only_first_mb",
+    ):
         raise ValueError("PP>1 GraphPP requires extracted FSDP parameter unsharding")
-    if compile_config.fsdp_gradient_sync_mode == "in_graph":
+    if compile_config.fsdp_gradient_sync_mode in (
+        "in_graph",
+        "in_graph_only_last_mb",
+    ):
         raise ValueError("PP>1 GraphPP requires deferred FSDP gradient reduction")
     return GraphRuntimeFSDPPolicy(
-        extract_fsdp_param_unshard=True,
-        extract_fsdp_grad_reduction=True,
+        schedule_fsdp_param_unshard=True,
+        schedule_fsdp_grad_reduction=True,
     )
 
 
@@ -136,7 +183,7 @@ def resolve_graph_runtime_gradient_accumulation_policy(
     num_microbatches: int,
     pp_enabled: bool,
     fsdp_enabled: bool,
-    extract_fsdp_grad_reduction: bool,
+    split_fsdp_grad_reduction: bool,
 ) -> GraphRuntimeGradientAccumulationPolicy:
     """Resolve gradient accumulation placement and optional WGrad fusion."""
     accumulation_mode = compile_config.gradient_accumulation_mode
@@ -162,20 +209,18 @@ def resolve_graph_runtime_gradient_accumulation_policy(
             raise ValueError(
                 "WGrad accumulation fusion is enabled but its pass is disabled"
             )
-        if fsdp_enabled and not extract_fsdp_grad_reduction:
+        if fsdp_enabled and not split_fsdp_grad_reduction:
             raise ValueError(
                 "WGrad accumulation fusion with FSDP requires "
-                "--compile.fsdp_gradient_sync_mode deferred_as_schedule_stage"
+                "FSDP gradient reduction outside the reusable graph"
             )
 
-    auto_accumulate_in_graph = num_microbatches > 1 and (
-        not fsdp_enabled or extract_fsdp_grad_reduction
-    )
+    auto_accumulate_in_graph = num_microbatches > 1
     accumulate_in_graph = accumulation_mode == "in_graph" or (
         accumulation_mode == "auto"
         and (auto_accumulate_in_graph or fusion_mode == "enabled")
     )
-    can_fuse_wgrad = not fsdp_enabled or extract_fsdp_grad_reduction
+    can_fuse_wgrad = not fsdp_enabled or split_fsdp_grad_reduction
     fuse_wgrad_accumulation = (
         accumulate_in_graph
         and can_fuse_wgrad
@@ -227,8 +272,7 @@ def _make_spmd_runtime_schedule(
     parallelism: ParallelismConfig,
     loss_fn: LossFunction,
     fsdp_enabled: bool,
-    extract_fsdp_param_unshard: bool,
-    extract_fsdp_grad_reduction: bool,
+    fsdp_policy: GraphRuntimeFSDPPolicy,
     accumulate_gradients_in_graph: bool,
 ) -> _PipelineScheduleRuntime:
     """Build an SPMD schedule with joint train-step actions."""
@@ -245,27 +289,47 @@ def _make_spmd_runtime_schedule(
         if fsdp_enabled
         else None
     )
+    if (
+        fsdp_policy.unshard_in_first_microbatch
+        and fsdp_reshard_after_forward is not False
+    ):
+        raise ValueError(
+            "in_graph_only_first_mb requires FSDP parameters to remain "
+            "unsharded across microbatches"
+        )
     reuse_unsharded_parameters = (
-        extract_fsdp_param_unshard and fsdp_reshard_after_forward is False
+        fsdp_policy.split_fsdp_param_unshard and fsdp_reshard_after_forward is False
+    )
+    reusable_computation_type = joint_forward_backward_computation_type(
+        split_fsdp_param_unshard=fsdp_policy.split_fsdp_param_unshard,
+        split_fsdp_grad_reduction=fsdp_policy.split_fsdp_grad_reduction,
     )
     actions: list[_Action] = []
-    if accumulate_gradients_in_graph:
-        actions.append(_Action(0, cast(Any, ZERO_GRAD_ACCUMS)))
-    if reuse_unsharded_parameters:
+    if reuse_unsharded_parameters and fsdp_policy.schedule_fsdp_param_unshard:
         actions.append(_Action(0, UNSHARD))
     for microbatch_index in range(num_microbatches):
-        if extract_fsdp_param_unshard and not reuse_unsharded_parameters:
+        if fsdp_policy.schedule_fsdp_param_unshard and not reuse_unsharded_parameters:
             actions.append(_Action(0, UNSHARD))
-        actions.append(_Action(0, cast(Any, FULL_FORWARD_BACKWARD), microbatch_index))
-        if extract_fsdp_param_unshard and not reuse_unsharded_parameters:
+        computation_type = reusable_computation_type
+        if microbatch_index == 0 and fsdp_policy.unshard_in_first_microbatch:
+            computation_type = FORWARD_BACKWARD_WITH_UNSHARD
+        elif microbatch_index == 0 and accumulate_gradients_in_graph:
+            computation_type = FORWARD_BACKWARD_NOGRADACCUM
+        elif (
+            microbatch_index == num_microbatches - 1
+            and fsdp_policy.reduce_grad_in_last_microbatch
+        ):
+            computation_type = FORWARD_BACKWARD_WITH_REDUCE_GRAD
+        actions.append(_Action(0, cast(Any, computation_type), microbatch_index))
+        if fsdp_policy.schedule_fsdp_param_unshard and not reuse_unsharded_parameters:
             actions.append(_Action(0, RESHARD))
-    if extract_fsdp_grad_reduction:
+    if fsdp_policy.schedule_fsdp_grad_reduction:
         actions.append(_Action(0, REDUCE_GRAD))
     if reuse_unsharded_parameters:
         actions.append(_Action(0, RESHARD))
     # Upstream schedule validation only recognizes separate F/B actions. PP=1
     # has no pipeline communication to lower, so install the already-lowered
-    # joint schedule directly instead of misrepresenting FULL_FORWARD_BACKWARD
+    # joint schedule directly instead of misrepresenting FORWARD_BACKWARD
     # as a container of split actions.
     schedule.stage_index_to_group_rank = {0: 0}
     stage.stage_index_to_group_rank = schedule.stage_index_to_group_rank
@@ -387,8 +451,10 @@ def _register_graph_runtime(
         compile_config=compile_config,
         model_config=model_config,
         parallelism=parallelism,
-        extract_fsdp_param_unshard=fsdp_policy.extract_fsdp_param_unshard,
-        extract_fsdp_grad_reduction=fsdp_policy.extract_fsdp_grad_reduction,
+        extract_fsdp_param_unshard=fsdp_policy.schedule_fsdp_param_unshard,
+        extract_fsdp_grad_reduction=fsdp_policy.schedule_fsdp_grad_reduction,
+        unshard_in_first_microbatch=fsdp_policy.unshard_in_first_microbatch,
+        reduce_grad_in_last_microbatch=fsdp_policy.reduce_grad_in_last_microbatch,
         accumulate_gradients_in_graph=(
             gradient_accumulation_policy.accumulate_in_graph
         ),
@@ -402,6 +468,8 @@ def _register_graph_runtime(
         schedule,
         graph_provider=graph_provider,
         activation_liveness_schedule=activation_liveness_schedule,
+        unshard_in_first_microbatch=fsdp_policy.unshard_in_first_microbatch,
+        reduce_grad_in_last_microbatch=fsdp_policy.reduce_grad_in_last_microbatch,
     )
 
 
@@ -419,9 +487,17 @@ def _make_spmd_graph_runtime(
     parallel_dims: ParallelDims,
 ) -> GraphRuntime:
     """Build SPMD execution with joint microbatch and optional FSDP actions."""
+    if (
+        fsdp_policy.unshard_in_first_microbatch
+        or fsdp_policy.reduce_grad_in_last_microbatch
+    ) and not gradient_accumulation_policy.accumulate_in_graph:
+        raise ValueError(
+            "First/last-microbatch FSDP graphs require in-graph gradient "
+            "accumulation"
+        )
     requires_graph_extraction = (
-        fsdp_policy.extract_fsdp_param_unshard
-        or fsdp_policy.extract_fsdp_grad_reduction
+        fsdp_policy.split_fsdp_param_unshard
+        or fsdp_policy.split_fsdp_grad_reduction
         or gradient_accumulation_policy.accumulate_in_graph
     )
     if requires_graph_extraction and compile_config.ep_overlap.enabled:
@@ -460,8 +536,7 @@ def _make_spmd_graph_runtime(
         parallelism=parallelism,
         loss_fn=loss_fn,
         fsdp_enabled=parallel_dims.fsdp_enabled,
-        extract_fsdp_param_unshard=fsdp_policy.extract_fsdp_param_unshard,
-        extract_fsdp_grad_reduction=fsdp_policy.extract_fsdp_grad_reduction,
+        fsdp_policy=fsdp_policy,
         accumulate_gradients_in_graph=(
             gradient_accumulation_policy.accumulate_in_graph
         ),
@@ -498,7 +573,7 @@ def _make_pipeline_parallel_graph_runtime(
         num_microbatches=num_microbatches,
         parallelism=parallelism,
         loss_fn=loss_fn,
-        extract_fsdp_grad_reduction=fsdp_policy.extract_fsdp_grad_reduction,
+        extract_fsdp_grad_reduction=fsdp_policy.schedule_fsdp_grad_reduction,
     )
     return _register_graph_runtime(
         schedule,
@@ -532,8 +607,18 @@ def make_graph_runtime(
     --------------------
     ``s`` is a stage index and ``m`` is a microbatch index:
 
-    - ``FULL_FORWARD_BACKWARD(s, m)`` runs one joint PP=1 train graph.
-    - ``ZERO_GRAD_ACCUMS(s)`` clears PP=1 graph-owned accumulators.
+    - ``FORWARD_BACKWARD_NOGRADACCUM(s, 0)`` runs the first PP=1 joint graph
+      without gradient accumulation and returns unsharded gradients that become
+      gradient accumulators for further graphs.
+    - ``FORWARD_BACKWARD(s, m)`` runs a repeated PP=1 joint graph without
+      UNSHARD or REDUCE_GRAD, takes gradient accumulator inputs, and accumulates
+      unsharded gradients into them in place.
+    - ``FORWARD_BACKWARD_WITH_UNSHARD(s, 0)`` also unshards parameters and
+      returns unsharded parameters and gradients that become gradient
+      accumulators.
+    - ``FORWARD_BACKWARD_WITH_REDUCE_GRAD(s, N - 1)`` takes unsharded
+      parameters and gradient accumulators, accumulates unsharded gradients
+      into them in place, and reduces the accumulated gradients.
     - ``FORWARD(s, m)`` runs a PP>1 stage-forward graph.
     - ``BACKWARD_WITH_REDUCE_GRAD(s, m)`` runs a PP>1 stage-backward graph
       containing FSDP gradient reduction.
@@ -556,34 +641,36 @@ def make_graph_runtime(
     4. Optionally extract FSDP UNSHARD and REDUCE_GRAD into separate schedule
        actions.
     5. Bind the graphs to schedule actions.
-    6. Initialize transient state for each local stage. Runtime-owned
-       accumulation starts with no accumulated gradients. For graph-owned
-       accumulation, ``ZERO_GRAD_ACCUMS`` clears persistent buffers and exposes
-       them through ``stage.state.unsharded_param_grads``.
-    7. Execute the schedule.
-    8. We do not rely on the autograd engine to achieve gradient accumulation.
-       PP=1 can trace gradient accumulation into the joint graph or perform it
-       in the runtime. For PP>1, gradient accumulation happens in the runtime.
-    9. Clear transient stage state.
+    6. Execute the schedule.
+    7. We do not rely on the autograd engine to achieve gradient accumulation.
+       PP=1 either accumulates inside the joint graphs or in the runtime. For
+       PP>1, gradient accumulation happens in the runtime.
+    8. Clear transient stage state.
 
     ``param.grad`` remains live until the optimizer step. Parameters, buffers,
-    and saved activations in ``stage.state`` live for one runtime invocation.
-    Graph-owned raw-gradient buffers remain allocated with the bound stage
-    graphs. PP=1 schedules clear them once at the optimizer-step boundary.
+    saved activations, and transient gradient references in ``stage.state``
+    live for one runtime invocation.
 
     Action state transitions
     ------------------------
     Before the first action, the runtime binds the stage graphs and records the
     live parameters, buffers, and trainable parameters in ``stage.state``.
 
-    - ``ZERO_GRAD_ACCUMS`` clears graph-owned gradient accumulators and stores
-      their references in ``stage.state.unsharded_param_grads``.
-    - ``FULL_FORWARD_BACKWARD`` appends the loss to ``stage.output_chunks`` and
+    - ``FORWARD_BACKWARD_NOGRADACCUM`` stores its returned gradients in
+      ``stage.state.unsharded_param_grads``. These tensors become the
+      accumulator inputs to later joint graphs.
+    - ``FORWARD_BACKWARD`` appends the loss to ``stage.output_chunks`` and
       ``schedule._internal_losses`` and increments the stage backward counter.
       With runtime-owned accumulation, reduced gradients go directly to
       ``param.grad`` while raw gradients accumulate for a later
-      ``REDUCE_GRAD``. With graph-owned accumulation, the graph updates its
-      persistent buffers and the runtime ignores its returned gradients.
+      ``REDUCE_GRAD``. With graph-owned accumulation, the graph updates the
+      first microbatch's gradient tensors in place.
+    - ``FORWARD_BACKWARD_WITH_UNSHARD`` initializes the gradient accumulators
+      and stores its additional unsharded parameter outputs in
+      ``stage.state.unsharded_param_values``.
+    - ``FORWARD_BACKWARD_WITH_REDUCE_GRAD`` accumulates its raw gradients,
+      reduces the complete accumulators, and returns only optimizer-visible
+      sharded gradients in ``stage.state.sharded_param_grads``.
     - ``FORWARD`` waits for and consumes any remote input receive, materializes
       parameter inputs if needed, saves its output and backward values in
       ``stage.fwd_cache[m]``, records last-stage losses, and forwards local
@@ -617,7 +704,7 @@ def make_graph_runtime(
     Calling convention:
     Runtime-owned accumulation with deferred reduction
 
-    FULL_FORWARD_BACKWARD(m) or backward action -> returned_param_grads
+    FORWARD_BACKWARD(m) or backward action -> returned_param_grads
     runtime accumulation           -> stage.state.unsharded_param_grads += grads
     REDUCE_GRAD                    -> stage.state.sharded_param_grads
     successful schedule exit       -> param.grad += final_param_grads
@@ -627,41 +714,53 @@ def make_graph_runtime(
     ``REDUCE_GRAD``. An empty ``param.grad`` is initialized with a clone because
     the graph may reuse its output storage.
 
-    Graph-owned accumulation gives the PP=1 joint graph persistent destination
-    buffers.
+    PP=1 graph-owned accumulation uses the first microbatch gradients as its
+    destination buffers. The runtime allocates no accumulator tensors; it only
+    carries graph outputs to the next graph inputs.
 
     Calling convention:
     Graph-owned accumulation
 
-    ZERO_GRAD_ACCUMS               -> zero stage.graphs.grad_accumulators
-    stage.state.unsharded_param_grads <- graph accumulator references
-    FULL_FORWARD_BACKWARD(m)        -> accumulator.add_(param_grads)
-    optional REDUCE_GRAD           -> stage.state.sharded_param_grads
-    successful schedule exit       -> param.grad += final_param_grads
+    FORWARD_BACKWARD_NOGRADACCUM(0) -> first_grads
+    stage.state.unsharded_param_grads <- first_grads
+    FORWARD_BACKWARD(1 ... N - 1) -> first_grads.add_(microbatch_grads)
+    optional REDUCE_GRAD -> stage.state.sharded_param_grads
+    successful schedule exit -> param.grad += final_param_grads
 
     WGrad fusion replaces a supported ``producer -> add_`` pair with a producer
     that writes directly into the same accumulator. It changes no runtime state
     transition. Unsupported producers retain the explicit ``add_``.
 
+    Calling convention:
+    Graph-owned accumulation with FSDP boundaries in edge microbatches
+
+    FORWARD_BACKWARD_WITH_UNSHARD(0)
+        -> loss, first_grads, retained_unsharded_params
+        -> stage.state.unsharded_param_grads = first_grads
+    FORWARD_BACKWARD(1 ... N - 2)
+        -> WGrad/add_ updates first_grads in place
+    FORWARD_BACKWARD_WITH_REDUCE_GRAD(N - 1)
+        -> WGrad/add_ updates first_grads, then reduce-scatter
+        -> stage.state.sharded_param_grads
+
     On exit, including after an exception, the runtime clears ``stage.state``,
     its bound-graph lookup, and per-call loss arguments. PP>1 evaluation
     performs the same setup and cleanup without committing gradients. PP=1
-    ``FULL_FORWARD_BACKWARD`` is currently training-only.
+    ``FORWARD_BACKWARD`` is currently training-only.
 
     SPMD schedule
     -------------
     With no extracted FSDP boundary and no graph-owned accumulation, PP=1
     retains the original workflow: trace the joint graph, optimize the joint
-    graph, and run it once per microbatch as ``FULL_FORWARD_BACKWARD``.
+    graph, and run it once per microbatch as ``FORWARD_BACKWARD``.
 
     With both FSDP boundaries extracted and unsharded parameters reused across
     microbatches, the schedule is::
 
-        ZERO_GRAD_ACCUMS(stage=0)  # only for graph-owned accumulation
         UNSHARD(stage=0)
-        FULL_FORWARD_BACKWARD(stage=0, microbatch=0)
+        FORWARD_BACKWARD_NOGRADACCUM(stage=0, microbatch=0)
         ...
-        FULL_FORWARD_BACKWARD(stage=0, microbatch=N - 1)
+        FORWARD_BACKWARD(stage=0, microbatch=N - 1)
         REDUCE_GRAD(stage=0)
         RESHARD(stage=0)
 
@@ -670,6 +769,19 @@ def make_graph_runtime(
     boundary is not extracted, its collective remains inside each joint graph
     invocation and its explicit action is absent. ``REDUCE_GRAD`` always runs
     once after the last microbatch when reduction is extracted.
+
+    With first/last-microbatch FSDP boundaries, the schedule is::
+
+        FORWARD_BACKWARD_WITH_UNSHARD(stage=0, microbatch=0)
+        FORWARD_BACKWARD(stage=0, microbatch=1)
+        ...
+        FORWARD_BACKWARD_WITH_REDUCE_GRAD(stage=0, microbatch=N - 1)
+        RESHARD(stage=0)
+
+    The first graph receives sharded parameters and returns both unsharded
+    values and gradients retained in runtime state for this step. Middle and
+    last graphs receive those values. Their WGrad producers update the first
+    microbatch gradients directly; the last graph then reduces them.
 
     Pipeline parallelism
     --------------------
@@ -696,7 +808,7 @@ def make_graph_runtime(
         model_config: Model configuration consumed by graph passes.
         loss_fn: Loss function used by the schedule and graph provider.
         trainer_config: Full Trainer configuration supplied for PP=1. Only the
-            ``FULL_FORWARD_BACKWARD`` path consumes it; PP>1 supplies ``None``.
+            ``FORWARD_BACKWARD`` path consumes it; PP>1 supplies ``None``.
     """
     if num_microbatches < 1:
         raise ValueError(
@@ -725,7 +837,7 @@ def make_graph_runtime(
         num_microbatches=num_microbatches,
         pp_enabled=pp_enabled,
         fsdp_enabled=parallel_dims.fsdp_enabled,
-        extract_fsdp_grad_reduction=fsdp_policy.extract_fsdp_grad_reduction,
+        split_fsdp_grad_reduction=fsdp_policy.split_fsdp_grad_reduction,
     )
 
     if pp_enabled:
@@ -742,8 +854,8 @@ def make_graph_runtime(
         )
 
     requires_graph_extraction = (
-        fsdp_policy.extract_fsdp_param_unshard
-        or fsdp_policy.extract_fsdp_grad_reduction
+        fsdp_policy.split_fsdp_param_unshard
+        or fsdp_policy.split_fsdp_grad_reduction
         or gradient_accumulation_policy.accumulate_in_graph
     )
     if compile_config.precompile_artifact_dir and requires_graph_extraction:
@@ -752,7 +864,7 @@ def make_graph_runtime(
             "boundaries or in-graph gradient accumulation"
         )
     if trainer_config is None:
-        raise ValueError("PP=1 FULL_FORWARD_BACKWARD requires Trainer config")
+        raise ValueError("PP=1 FORWARD_BACKWARD requires Trainer config")
     return _make_spmd_graph_runtime(
         stages[0],
         num_microbatches=num_microbatches,

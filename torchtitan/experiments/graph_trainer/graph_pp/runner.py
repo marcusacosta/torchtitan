@@ -33,8 +33,10 @@ from torch.distributed.pipelining.stage import _normalize_model_output_as_tuple
 
 from torchtitan.experiments.graph_trainer.common_utils import accumulate_param_grads_
 from torchtitan.experiments.graph_trainer.graph_pp.stage import (
+    FSDPBoundaryJointStageGraphs,
     GraphPipelineStage,
     JointStageGraphs,
+    NoGradAccumJointStageGraphs,
     OverlapStageGraphs,
     SplitStageGraphs,
     StageGraphs,
@@ -53,33 +55,62 @@ __all__ = [
     "BACKWARD",
     "BACKWARD_WEIGHT_WITH_REDUCE_GRAD",
     "BACKWARD_WITH_REDUCE_GRAD",
+    "FORWARD_BACKWARD",
+    "FORWARD_BACKWARD_NOGRADACCUM",
+    "FORWARD_BACKWARD_WITH_REDUCE_GRAD",
+    "FORWARD_BACKWARD_WITH_UNSHARD",
     "FULL_FORWARD_BACKWARD",
     "GraphRuntime",
-    "ZERO_GRAD_ACCUMS",
     "register_graph_schedule",
 ]
 
 
 class _GraphComputationType(Enum):
-    # Reset graph-owned gradient accumulators before schedule microbatches run.
-    ZERO_GRAD_ACCUMS = "ZERO_GRAD_ACCUMS"
     # Backward graph with gradient reduction extracted into REDUCE_GRAD.
     BACKWARD = "BACKWARD"
     # Backward graph that includes gradient reduction.
     BACKWARD_WITH_REDUCE_GRAD = "BACKWARD_WITH_REDUCE_GRAD"
     # Weight-backward graph that includes gradient reduction.
     BACKWARD_WEIGHT_WITH_REDUCE_GRAD = "BACKWARD_WEIGHT_WITH_REDUCE_GRAD"
-    # Conventional joint graph with forward, loss, backward, and collectives inside.
+    # Joint graph with FSDP unshard and gradient reduction extracted.
+    FORWARD_BACKWARD = "FORWARD_BACKWARD"
+    # Joint graph without accumulation whose outputs become accumulators.
+    FORWARD_BACKWARD_NOGRADACCUM = "FORWARD_BACKWARD_NOGRADACCUM"
+    # Joint graph with unsharding inside; the first-microbatch variant retains it.
+    FORWARD_BACKWARD_WITH_UNSHARD = "FORWARD_BACKWARD_WITH_UNSHARD"
+    # Joint graph with reduction inside; the last-microbatch variant defers it.
+    FORWARD_BACKWARD_WITH_REDUCE_GRAD = "FORWARD_BACKWARD_WITH_REDUCE_GRAD"
+    # Joint graph with both FSDP boundaries inside every microbatch.
     FULL_FORWARD_BACKWARD = "FULL_FORWARD_BACKWARD"
 
 
-ZERO_GRAD_ACCUMS = _GraphComputationType.ZERO_GRAD_ACCUMS
 BACKWARD = _GraphComputationType.BACKWARD
 BACKWARD_WITH_REDUCE_GRAD = _GraphComputationType.BACKWARD_WITH_REDUCE_GRAD
 BACKWARD_WEIGHT_WITH_REDUCE_GRAD = (
     _GraphComputationType.BACKWARD_WEIGHT_WITH_REDUCE_GRAD
 )
+FORWARD_BACKWARD = _GraphComputationType.FORWARD_BACKWARD
+FORWARD_BACKWARD_NOGRADACCUM = _GraphComputationType.FORWARD_BACKWARD_NOGRADACCUM
+FORWARD_BACKWARD_WITH_UNSHARD = _GraphComputationType.FORWARD_BACKWARD_WITH_UNSHARD
+FORWARD_BACKWARD_WITH_REDUCE_GRAD = (
+    _GraphComputationType.FORWARD_BACKWARD_WITH_REDUCE_GRAD
+)
 FULL_FORWARD_BACKWARD = _GraphComputationType.FULL_FORWARD_BACKWARD
+
+
+def joint_forward_backward_computation_type(
+    *, split_fsdp_param_unshard: bool, split_fsdp_grad_reduction: bool
+) -> _GraphComputationType:
+    """Name a joint action by the FSDP boundaries inside its reusable graph."""
+    if not split_fsdp_param_unshard:
+        return (
+            FORWARD_BACKWARD_WITH_UNSHARD
+            if split_fsdp_grad_reduction
+            else FULL_FORWARD_BACKWARD
+        )
+    if not split_fsdp_grad_reduction:
+        return FORWARD_BACKWARD_WITH_REDUCE_GRAD
+    return FORWARD_BACKWARD
 
 
 def _scale_grad_values_(grads: list[Any], grad_scale_factor: int) -> None:
@@ -487,18 +518,13 @@ class GraphRuntime:
         stage.state.sharded_param_grads = []
         stage._graph_pp_grads_scaled = False
 
-    def _handle_zero_grad_accums(self, action: _Action, ctx: _PipelineContext) -> None:
-        self.ensure_ready(ctx)
-        _, stage = _stage_map_and_stage_from_action(self.schedule, action)
-        graphs = self.stage_graphs[stage.stage_index]
-        stage.state.unsharded_param_grads = graphs.zero_grad_()
-        stage.state.sharded_param_grads = []
-
     @staticmethod
     def _initialize_split_grad_accumulators(
         stage: GraphPipelineStage,
         grads: list[Any],
     ) -> None:
+        # PP>1 and PP=1 without in-graph accumulation use runtime-owned slots.
+        # PP=1 in-graph bypasses this helper and carries only references in state.
         if not stage.state.unsharded_param_grads:
             stage.state.unsharded_param_grads = [None] * len(grads)
 
@@ -558,35 +584,52 @@ class GraphRuntime:
         self._initialize_split_grad_accumulators(stage, grads)
         _accumulate_stage_unsharded_grads(stage, grads)
 
-    def _handle_full_forward_backward(
-        self, action: _Action, ctx: _PipelineContext
-    ) -> None:
+    def _handle_forward_backward(self, action: _Action, ctx: _PipelineContext) -> None:
         self.ensure_ready(ctx)
         _, stage = _stage_map_and_stage_from_action(self.schedule, action)
         mb_index = action.microbatch_index
         if mb_index is None:
             raise ValueError(
-                "GraphPP FULL_FORWARD_BACKWARD action must have microbatch "
+                f"GraphPP {action.computation_type.value} action must have microbatch "
                 f"index: {action}"
             )
         args, kwargs, target = _prepare_fwd_user_args(stage, mb_index, ctx)
         graphs = cast(JointStageGraphs, self.stage_graphs[stage.stage_index])
         if not stage.has_backward:
             raise NotImplementedError(
-                "GraphPP FULL_FORWARD_BACKWARD does not support forward-only execution"
+                "GraphPP joint forward/backward does not support forward-only "
+                "execution"
             )
         _ensure_unsharded_param_values(stage, graphs)
-        loss, param_grads = graphs.forward_backward(
-            args,
-            kwargs,
-            target,
-            self.loss_kwargs,
-            unsharded_param_values=stage.state.unsharded_param_values,
-            flat_buffer_values=stage.state.flat_buffer_values,
-            runtime_validate=stage._runtime_validate,
+        initializes_grad_accumulators = (
+            action.computation_type == FORWARD_BACKWARD_NOGRADACCUM
         )
+        if initializes_grad_accumulators:
+            no_grad_accum_graphs = cast(NoGradAccumJointStageGraphs, graphs)
+            loss, param_grads = no_grad_accum_graphs.forward_backward_nogradaccum(
+                args,
+                kwargs,
+                target,
+                self.loss_kwargs,
+                unsharded_param_values=stage.state.unsharded_param_values,
+                flat_buffer_values=stage.state.flat_buffer_values,
+                runtime_validate=stage._runtime_validate,
+            )
+        else:
+            loss, param_grads = graphs.forward_backward(
+                args,
+                kwargs,
+                target,
+                self.loss_kwargs,
+                unsharded_param_values=stage.state.unsharded_param_values,
+                flat_buffer_values=stage.state.flat_buffer_values,
+                grad_accumulators=stage.state.unsharded_param_grads,
+                runtime_validate=stage._runtime_validate,
+            )
         self.schedule.backward_counter[stage.stage_index] += 1
-        if not graphs.accumulates_gradients_in_graph:
+        if initializes_grad_accumulators:
+            stage.state.unsharded_param_grads = param_grads
+        elif not graphs.accumulates_gradients_in_graph:
             if _grad_reduction_runs_in_joint(self.schedule, action):
                 reduced_grads = graphs.reduce_grads(
                     param_grads,
@@ -598,6 +641,75 @@ class GraphRuntime:
             else:
                 self._initialize_split_grad_accumulators(stage, param_grads)
                 _accumulate_stage_unsharded_grads(stage, param_grads)
+        stage.output_chunks.append(loss)
+        self.schedule._internal_losses.append(loss)
+
+    def _handle_forward_backward_with_unshard(
+        self, action: _Action, ctx: _PipelineContext
+    ) -> None:
+        self.ensure_ready(ctx)
+        _, stage = _stage_map_and_stage_from_action(self.schedule, action)
+        mb_index = action.microbatch_index
+        if mb_index is None:
+            raise ValueError(
+                "GraphRuntime FORWARD_BACKWARD_WITH_UNSHARD action must have "
+                f"microbatch index: {action}"
+            )
+        args, kwargs, target = _prepare_fwd_user_args(stage, mb_index, ctx)
+        graphs = cast(
+            FSDPBoundaryJointStageGraphs,
+            self.stage_graphs[stage.stage_index],
+        )
+        (
+            loss,
+            param_grads,
+            unsharded_param_values,
+        ) = graphs.forward_backward_with_unshard(
+            args,
+            kwargs,
+            target,
+            self.loss_kwargs,
+            flat_param_values=stage.state.flat_param_values,
+            flat_buffer_values=stage.state.flat_buffer_values,
+            runtime_validate=stage._runtime_validate,
+        )
+        stage.state.unsharded_param_values = unsharded_param_values
+        if graphs.accumulates_gradients_in_graph:
+            stage.state.unsharded_param_grads = param_grads
+        self.schedule.backward_counter[stage.stage_index] += 1
+        stage.output_chunks.append(loss)
+        self.schedule._internal_losses.append(loss)
+
+    def _handle_forward_backward_with_reduce_grad(
+        self, action: _Action, ctx: _PipelineContext
+    ) -> None:
+        self.ensure_ready(ctx)
+        _, stage = _stage_map_and_stage_from_action(self.schedule, action)
+        mb_index = action.microbatch_index
+        if mb_index is None:
+            raise ValueError(
+                "GraphRuntime FORWARD_BACKWARD_WITH_REDUCE_GRAD action must have "
+                f"microbatch index: {action}"
+            )
+        args, kwargs, target = _prepare_fwd_user_args(stage, mb_index, ctx)
+        graphs = cast(
+            FSDPBoundaryJointStageGraphs,
+            self.stage_graphs[stage.stage_index],
+        )
+        _ensure_unsharded_param_values(stage, graphs)
+        loss, sharded_param_grads = graphs.forward_backward_with_reduce_grad(
+            args,
+            kwargs,
+            target,
+            self.loss_kwargs,
+            unsharded_param_values=stage.state.unsharded_param_values,
+            flat_buffer_values=stage.state.flat_buffer_values,
+            grad_accumulators=stage.state.unsharded_param_grads,
+            runtime_validate=stage._runtime_validate,
+        )
+        stage.state.sharded_param_grads = sharded_param_grads
+        _scale_graph_pp_sharded_grads(stage, self.schedule)
+        self.schedule.backward_counter[stage.stage_index] += 1
         stage.output_chunks.append(loss)
         self.schedule._internal_losses.append(loss)
 
@@ -901,6 +1013,8 @@ def register_graph_schedule(
     *,
     graph_provider: StageGraphsProvider | None = None,
     activation_liveness_schedule: _PipelineScheduleRuntime | None = None,
+    unshard_in_first_microbatch: bool = False,
+    reduce_grad_in_last_microbatch: bool = False,
 ) -> GraphRuntime:
     """Register graph action handlers on a runtime schedule.
 
@@ -910,6 +1024,10 @@ def register_graph_schedule(
         graph_provider (StageGraphsProvider | None): Optional provider
             that builds or attaches stage graphs before the first runtime
             action in each step.
+        unshard_in_first_microbatch (bool): Whether the unshard action returns
+            parameter values retained across later microbatches.
+        reduce_grad_in_last_microbatch (bool): Whether the reduction action
+            consumes the in-graph gradient accumulators on the last microbatch.
     Returns:
         GraphRuntime: Runtime that owns the registered bound action handlers.
 
@@ -939,11 +1057,28 @@ def register_graph_schedule(
     # (action, context) -> None handlers but are outside PyTorch's accepted
     # computation types.
     for computation_type, handler in (
-        (ZERO_GRAD_ACCUMS, runtime._handle_zero_grad_accums),
         (BACKWARD, runtime._handle_backward),
         (BACKWARD_WITH_REDUCE_GRAD, runtime._handle_backward),
         (BACKWARD_WEIGHT_WITH_REDUCE_GRAD, runtime._handle_backward_weight),
-        (FULL_FORWARD_BACKWARD, runtime._handle_full_forward_backward),
+        (FORWARD_BACKWARD, runtime._handle_forward_backward),
+        (FORWARD_BACKWARD_NOGRADACCUM, runtime._handle_forward_backward),
+        (FULL_FORWARD_BACKWARD, runtime._handle_forward_backward),
+        (
+            FORWARD_BACKWARD_WITH_UNSHARD,
+            (
+                runtime._handle_forward_backward_with_unshard
+                if unshard_in_first_microbatch
+                else runtime._handle_forward_backward
+            ),
+        ),
+        (
+            FORWARD_BACKWARD_WITH_REDUCE_GRAD,
+            (
+                runtime._handle_forward_backward_with_reduce_grad
+                if reduce_grad_in_last_microbatch
+                else runtime._handle_forward_backward
+            ),
+        ),
     ):
         schedule._comp_type_to_function_map[
             computation_type

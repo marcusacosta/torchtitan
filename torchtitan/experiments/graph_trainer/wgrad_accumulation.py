@@ -96,6 +96,77 @@ def _validate_accumulator(
         )
 
 
+def _insert_accumulator_placeholders(
+    gm: fx.GraphModule,
+    grad_outputs: list[Any] | tuple[Any, ...],
+    accumulator_values: tuple[Any, ...],
+    *,
+    device: torch.device,
+) -> list[fx.Node | None]:
+    first_compute = next(node for node in gm.graph.nodes if node.op != "placeholder")
+    accumulator_nodes: list[fx.Node | None] = []
+    node_by_accumulator: dict[tuple[str, int], tuple[fx.Node, fx.Node]] = {}
+    with gm.graph.inserting_before(first_compute):
+        for index, (grad, accumulator) in enumerate(
+            zip(grad_outputs, accumulator_values, strict=True)
+        ):
+            grad_value = _tensor_meta(grad) if isinstance(grad, fx.Node) else None
+            if grad_value is None:
+                accumulator_nodes.append(None)
+                continue
+            if isinstance(accumulator, torch.Tensor):
+                _validate_accumulator(
+                    accumulator,
+                    grad_value,
+                    index=index,
+                    device=device,
+                )
+                accumulator_key = ("tensor", id(accumulator))
+            elif type(accumulator) is int:
+                accumulator_key = ("output", accumulator)
+            else:
+                raise ValueError(
+                    "Graph runtime tensor gradient has no matching tensor accumulator "
+                    f"at index {index}"
+                )
+            existing = node_by_accumulator.get(accumulator_key)
+            if existing is not None:
+                previous_grad, node = existing
+                if grad is not previous_grad:
+                    raise ValueError(
+                        "One graph runtime gradient accumulator cannot represent "
+                        f"different graph outputs at index {index}"
+                    )
+                accumulator_nodes.append(node)
+                continue
+            node = gm.graph.placeholder(f"graph_runtime_grad_accumulator_{index}")
+            node.meta = copy.copy(grad.meta)
+            # The accumulator input and this microbatch's gradient are separate
+            # values, so their fake tensors must be distinct.
+            node.meta["val"] = grad_value.new_empty_strided(
+                grad_value.shape,
+                grad_value.stride(),
+                requires_grad=grad_value.requires_grad,
+            )
+            node.meta[_STATIC_INPUT_META] = True
+            node_by_accumulator[accumulator_key] = (grad, node)
+            accumulator_nodes.append(node)
+    return accumulator_nodes
+
+
+def _gradient_output_accumulator_indices(
+    grad_outputs: list[Any] | tuple[Any, ...],
+) -> tuple[int | None, ...]:
+    accumulator_index_by_grad: dict[fx.Node, int] = {}
+    indices: list[int | None] = []
+    for index, grad in enumerate(grad_outputs):
+        if not isinstance(grad, fx.Node) or _tensor_meta(grad) is None:
+            indices.append(None)
+            continue
+        indices.append(accumulator_index_by_grad.setdefault(grad, index))
+    return tuple(indices)
+
+
 def insert_graph_gradient_accumulation(
     gm: fx.GraphModule,
     *,
@@ -153,50 +224,12 @@ def insert_graph_gradient_accumulation(
             )
         accumulator_values = accumulators
 
-    first_compute = next(node for node in gm.graph.nodes if node.op != "placeholder")
-    accumulator_nodes: list[fx.Node | None] = []
-    node_by_accumulator_id: dict[int, tuple[fx.Node, fx.Node]] = {}
-    with gm.graph.inserting_before(first_compute):
-        for index, (grad, accumulator) in enumerate(
-            zip(grad_outputs, accumulator_values, strict=True)
-        ):
-            grad_value = _tensor_meta(grad) if isinstance(grad, fx.Node) else None
-            if grad_value is None:
-                accumulator_nodes.append(None)
-                continue
-            if not isinstance(accumulator, torch.Tensor):
-                raise ValueError(
-                    "Graph runtime tensor gradient has no matching tensor accumulator "
-                    f"at index {index}"
-                )
-            _validate_accumulator(
-                accumulator,
-                grad_value,
-                index=index,
-                device=device,
-            )
-            existing = node_by_accumulator_id.get(id(accumulator))
-            if existing is not None:
-                previous_grad, node = existing
-                if grad is not previous_grad:
-                    raise ValueError(
-                        "One graph runtime gradient accumulator cannot represent "
-                        f"different graph outputs at index {index}"
-                    )
-                accumulator_nodes.append(node)
-                continue
-            node = gm.graph.placeholder(f"graph_runtime_grad_accumulator_{index}")
-            node.meta = copy.copy(grad.meta)
-            # The persistent accumulator and this microbatch's gradient are
-            # separate runtime buffers, so their fake tensors must be distinct.
-            node.meta["val"] = grad_value.new_empty_strided(
-                grad_value.shape,
-                grad_value.stride(),
-                requires_grad=grad_value.requires_grad,
-            )
-            node.meta[_STATIC_INPUT_META] = True
-            node_by_accumulator_id[id(accumulator)] = (grad, node)
-            accumulator_nodes.append(node)
+    accumulator_nodes = _insert_accumulator_placeholders(
+        gm,
+        grad_outputs,
+        accumulator_values,
+        device=device,
+    )
 
     accumulated_outputs: list[Any] = []
     sink_by_accumulator: dict[fx.Node, fx.Node] = {}
@@ -230,6 +263,102 @@ def insert_graph_gradient_accumulation(
     gm.graph.lint()
     gm.recompile()
     return accumulator_values
+
+
+def insert_graph_gradient_accumulation_from_outputs(
+    gm: fx.GraphModule,
+    *,
+    num_param_grads: int,
+    device: torch.device,
+    param_grad_output_start: int = 0,
+) -> tuple[int | None, ...]:
+    """Accumulate into gradient tensors returned by an earlier graph."""
+    outputs = graph_outputs(gm.graph)
+    param_grad_output_end = param_grad_output_start + num_param_grads
+    grad_outputs = outputs[param_grad_output_start:param_grad_output_end]
+    accumulator_indices = _gradient_output_accumulator_indices(grad_outputs)
+    insert_graph_gradient_accumulation(
+        gm,
+        num_param_grads=num_param_grads,
+        param_grad_output_start=param_grad_output_start,
+        accumulators=accumulator_indices,
+        device=device,
+    )
+    return accumulator_indices
+
+
+def insert_graph_gradient_accumulation_before_reduction(
+    gm: fx.GraphModule,
+    *,
+    param_grad_output_names: tuple[str, ...],
+    reduce_grad_input_names: tuple[str, ...],
+    accumulators: tuple[Any, ...],
+    device: torch.device,
+) -> tuple[Any, ...]:
+    """Accumulate raw gradients before their in-graph reduction suffix."""
+    if len(param_grad_output_names) != len(accumulators):
+        raise ValueError(
+            "Gradient accumulator count does not match parameter gradients: "
+            f"{len(accumulators)} != {len(param_grad_output_names)}"
+        )
+    accumulator_by_name: dict[str, Any] = {}
+    for name, accumulator in zip(
+        param_grad_output_names,
+        accumulators,
+        strict=True,
+    ):
+        previous = accumulator_by_name.setdefault(name, accumulator)
+        if previous is not accumulator:
+            raise ValueError(f"Parameter gradient {name} maps to multiple accumulators")
+
+    nodes_by_name = {node.name: node for node in gm.graph.nodes}
+    try:
+        grad_inputs = [nodes_by_name[name] for name in reduce_grad_input_names]
+        accumulator_values = tuple(
+            accumulator_by_name[name] for name in reduce_grad_input_names
+        )
+    except KeyError as error:
+        raise ValueError(
+            f"Gradient reduction input has no accumulator: {error.args[0]}"
+        ) from error
+
+    accumulator_nodes = _insert_accumulator_placeholders(
+        gm,
+        grad_inputs,
+        accumulator_values,
+        device=device,
+    )
+    graph_input_accumulators: list[Any] = []
+    seen_accumulators: set[tuple[str, int]] = set()
+    for grad, accumulator, accumulator_value in zip(
+        grad_inputs,
+        accumulator_nodes,
+        accumulator_values,
+        strict=True,
+    ):
+        if accumulator is None:
+            continue
+        accumulator_key = (
+            ("tensor", id(accumulator_value))
+            if isinstance(accumulator_value, torch.Tensor)
+            else ("output", accumulator_value)
+        )
+        if accumulator_key not in seen_accumulators:
+            seen_accumulators.add(accumulator_key)
+            graph_input_accumulators.append(accumulator_value)
+        old_users = list(grad.users)
+        with gm.graph.inserting_after(grad):
+            sink = gm.graph.call_function(
+                torch.ops.aten.add_.Tensor,
+                args=(accumulator, grad),
+            )
+        sink.meta = copy.copy(grad.meta)
+        for user in old_users:
+            user.replace_input_with(grad, sink)
+
+    gm.graph.lint()
+    gm.recompile()
+    return tuple(graph_input_accumulators)
 
 
 def _tensor_meta(node: fx.Node) -> torch.Tensor | None:
@@ -492,4 +621,5 @@ def fuse_wgrad_accumulation_pass(
 __all__ = [
     "fuse_wgrad_accumulation_pass",
     "insert_graph_gradient_accumulation",
+    "insert_graph_gradient_accumulation_from_outputs",
 ]
