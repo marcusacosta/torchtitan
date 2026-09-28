@@ -123,7 +123,8 @@ class CompileConfig:
     local_compile: list[str] = field(default_factory=lambda: ["gated_rmsnorm"])
     """Functions to compile independently with ``torch.compile``.
 
-    Gated RMSNorm is enabled by default; loss compilation is opt-in.
+    Gated RMSNorm is enabled by default; Offset RMSNorm and loss compilation are
+    opt-in.
     """
 
     backend: str = "inductor"
